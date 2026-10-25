@@ -73,7 +73,10 @@ const MAX_MAGNITUDE := 1.0e9
 ## made), refuse module files outside the level's own folder, so a manifest
 ## cannot point the importer at other files on the machine. A level under
 ## res:// may share a modules folder beside it (../modules), as VOXEN's do.
-@export var confine_to_level_folder: bool = true
+@export var confine_to_level_folder: bool = true:
+	set(value):
+		confine_to_level_folder = value
+		_changed()
 
 @export_group("Collision")
 ## Give the level static collision: each module's mesh as a trimesh shape,
