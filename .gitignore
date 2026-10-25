@@ -1,4 +1,3 @@
 .godot/
 *.import
-!tests/fixtures/**/*.import
 tests/generated/

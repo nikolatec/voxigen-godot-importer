@@ -48,9 +48,32 @@ static func write_level(dir: String, version := 3, extra := {}) -> String:
 	file.close()
 	return path
 
+## Writes `level.json` with exactly `manifest` (plus version 3), beside the
+## modules write_level made in `dir`.
+static func write_manifest(dir: String, manifest: Dictionary) -> String:
+	var body := {"version": 3, "generator": "voxigen-tests", "modules": [], "placements": [], "lights": []}
+	body.merge(manifest, true)
+	var path := dir.path_join("level.json")
+	var file := FileAccess.open(path, FileAccess.WRITE)
+	file.store_string(JSON.stringify(body, "  "))
+	file.close()
+	return path
+
+## A module coloured by a texture rather than vertex colours, as VoxiGen's
+## textured export writes it.
+static func write_textured_glb(path: String, size: float) -> void:
+	_write_glb(path, size, Color.WHITE, true)
+
+## A file named .glb that is not one.
+static func write_broken_glb(path: String) -> void:
+	var file := FileAccess.open(path, FileAccess.WRITE)
+	file.store_string("not a glb")
+	file.close()
+
 # A cube `size` voxels on an edge, standing on its bottom centre as VoxiGen's
-# modules do, coloured by COLOR_0 over a white base colour as VoxiGen writes.
-static func _write_glb(path: String, size: float, color: Color) -> void:
+# modules do, coloured by COLOR_0 over a white base colour as VoxiGen writes —
+# or, `textured`, by an albedo texture and no vertex colour.
+static func _write_glb(path: String, size: float, color: Color, textured := false) -> void:
 	var box := BoxMesh.new()
 	box.size = Vector3.ONE * size
 	var arrays := box.get_mesh_arrays()
@@ -60,11 +83,16 @@ static func _write_glb(path: String, size: float, color: Color) -> void:
 		verts[i].y += size / 2.0
 		colors.append(color)
 	arrays[Mesh.ARRAY_VERTEX] = verts
-	arrays[Mesh.ARRAY_COLOR] = colors
+	if not textured:
+		arrays[Mesh.ARRAY_COLOR] = colors
 	var mesh := ArrayMesh.new()
 	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
 	var material := StandardMaterial3D.new()
 	material.albedo_color = Color.WHITE
+	if textured:
+		var image := Image.create(4, 4, false, Image.FORMAT_RGBA8)
+		image.fill(Color(0.2, 0.6, 0.3))
+		material.albedo_texture = ImageTexture.create_from_image(image)
 	mesh.surface_set_material(0, material)
 	var root := Node3D.new()
 	root.name = path.get_file().get_basename()

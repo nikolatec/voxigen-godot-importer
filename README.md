@@ -28,8 +28,8 @@ VOXEN, a voxel shooter, builds every one of its levels this way.
 ## Install
 
 Copy `addons/voxigen_level` into your project's `addons/` folder and enable
-**VoxiGen Level Importer** in *Project → Project Settings → Plugins*. Developed
-and tested on Godot 4.7.
+**VoxiGen Level Importer** in *Project → Project Settings → Plugins*. Requires
+Godot 4.4 or later; tested on 4.7.
 
 ## Use
 
@@ -54,6 +54,18 @@ add_child(level)
 level.load_level("res://levels/dungeon/level.json")
 ```
 
+### Levels inside and outside the project
+
+A level under `res://` is drawn from the GLBs Godot imported, with your
+project's import settings: by default Godot generates its own mesh LODs and
+shadow meshes. A level loaded from disk at runtime gets neither, so the two
+can render slightly differently. If you use VoxiGen's LODs (`lod_distances_m`),
+turn off **Meshes → Generate LODs** in the import settings of the `modules`
+folder so the two kinds don't stack.
+
+Levels loaded at runtime are read as untrusted input: a malformed module,
+placement or light is skipped with a warning instead of being built wrong.
+
 ## Settings
 
 | Property | Default | |
@@ -66,7 +78,7 @@ level.load_level("res://levels/dungeon/level.json")
 | `collision`, `collision_layer`, `collision_mask` | on, 1, 1 | Static trimesh collision. |
 | `light_energy_scale`, `light_range_scale` | `1`, `1` | Calibrate VoxiGen's light intensity and range for your renderer. |
 | `shadow_distance_m` | `0` | Shadowed point/spot lights cast shadows only this near the camera. `0`: always. |
-| `lod_distances_m` | `(0, 0)` | Where half-detail (x) and quarter-detail (y) meshes take over. `(0, 0)`: off. |
+| `lod_distances_m` | `(0, 0)` | Where half-detail (x) and quarter-detail (y) meshes take over, measured to each chunk's centre — so it needs `chunk_size_m` above 0. `(0, 0)`: off. |
 
 Signals: `level_loaded(modules, placements)` and `marker_found(marker, at)`.
 

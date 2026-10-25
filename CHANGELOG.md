@@ -6,4 +6,9 @@
   batched modules per chunk, vertex colours, module and level lights, markers,
   shared trimesh collision and level of detail.
 - Loads levels under `res://` through Godot's import, and levels anywhere else
-  on disk at runtime.
+  on disk at runtime; malformed entries are skipped with a warning.
+- Reloading a level reads its modules again, so a re-export shows up.
+- One collision shape per module, shared across every chunk.
+- Textured exports keep their texture; vertex colour is used only where a
+  mesh has it.
+- Every setting refreshes the editor preview.

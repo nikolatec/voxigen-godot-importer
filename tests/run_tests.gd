@@ -21,6 +21,11 @@ func _initialize() -> void:
 	_test_lod()
 	_test_versions()
 	_test_no_chunks()
+	_test_reload()
+	_test_malformed()
+	_test_shared_shapes()
+	_test_spot()
+	_test_textured_and_broken()
 	print("\n%s" % ("ALL PASSED" if failures == 0 else "%d FAILED" % failures))
 	quit(1 if failures else 0)
 
@@ -164,4 +169,124 @@ func _test_no_chunks() -> void:
 	for v in ((_of(level, "CollisionShape3D")[0] as CollisionShape3D).shape as ConcavePolygonShape3D).get_faces():
 		top = maxf(top, v.y)
 	_check(is_equal_approx(top, 32.0 / 16.0), "collision follows a changed voxel size")
+	level.free()
+
+func _top_of_collision(level: Node) -> float:
+	var top := -INF
+	for v in ((_of(level, "CollisionShape3D")[0] as CollisionShape3D).shape as ConcavePolygonShape3D).get_faces():
+		top = maxf(top, v.y)
+	return top
+
+func _test_reload() -> void:
+	print("level: re-exported to the same path")
+	var dir := "user://voxigen_tests/reload"
+	var path := Fixtures.write_level(dir)
+	var level := _level(path)
+	level.load_level(path)
+	var before := _top_of_collision(level)
+	# The same file names, a different cube: what a re-export does.
+	Fixtures._write_glb(dir.path_join("modules/cube.glb"), 64.0, Color.BLUE)
+	level.load_level(path)
+	_check(is_equal_approx(before, 32 * S) and is_equal_approx(_top_of_collision(level), 64 * S),
+		"reloading reads the module again, not a cached copy")
+	level.free()
+
+func _test_malformed() -> void:
+	print("level: malformed manifest entries")
+	var dir := "user://voxigen_tests/malformed"
+	Fixtures.write_level(dir)
+	var path := Fixtures.write_manifest(dir, {
+		"modules": [
+			{"name": "cube", "file": "modules/cube.glb", "lods": null, "lights": "torch"},
+			"not a module",
+		],
+		"placements": [
+			{"module": "cube", "position": [0, 0, 0], "rotation": [0, 0, 0, 1]},
+			{"module": "cube", "position": [32, 0], "rotation": [0, 0, 0, 1]},
+			{"module": "cube", "position": [64, 0, 0], "rotation": "none"},
+			{"module": "cube", "position": [96, "0", 0], "rotation": [0, 0, 0, 1]},
+			{"module": "cube", "position": [128, 0, 0], "rotation": [0, 0, 0, 0]},
+			42,
+		],
+		"lights": [
+			{"type": "point", "position": [0, 0], "color": [1, 1, 1], "range": 10},
+			{"type": "point", "position": [0, 8, 0], "color": [1, 1, 1], "range": "far", "intensity": null},
+			"sun",
+		],
+	})
+	var level := _level(path)
+	var placed := level.load_level(path)
+	_check(placed == 2, "builds only the well-formed placements (got %d)" % placed)
+	var origins := []
+	for shape: CollisionShape3D in _of(level, "CollisionShape3D"):
+		origins.append(shape.position)
+	_check(origins.size() == 2 and origins.all(func(o: Vector3) -> bool: return o.x < 0.01 or _near(o, Vector3(128, 0, 0) * S)),
+		"never builds a bad placement at the origin at the wrong scale")
+	var lights := _of(level, "OmniLight3D")
+	_check(lights.size() == 1 and is_equal_approx((lights[0] as OmniLight3D).omni_range, 0.0) \
+		and is_equal_approx((lights[0] as OmniLight3D).light_energy, 1.0),
+		"skips a malformed light; falls back on a mistyped number")
+	_check(level.get_node_or_null("cube_lod1") == null, "a null lods list means none")
+	level.free()
+
+func _test_shared_shapes() -> void:
+	print("level: collision shared across chunks")
+	var path := Fixtures.write_level("user://voxigen_tests/shared")
+	var level := _level(path)
+	level.load_level(path)
+	var cube_shapes := {}
+	for shape: CollisionShape3D in _of(level, "CollisionShape3D"):
+		if shape.get_parent().name.begins_with("cube"):
+			cube_shapes[shape.shape] = true
+	_check(level.get_node_or_null("cube_0_0_0_collision") != null and level.get_node_or_null("cube_2_0_0_collision") != null \
+		and cube_shapes.size() == 1, "every chunk's placements share one shape per module")
+	level.free()
+
+func _test_spot() -> void:
+	print("level: spot light")
+	var dir := "user://voxigen_tests/spot"
+	Fixtures.write_level(dir)
+	var path := Fixtures.write_manifest(dir, {"lights": [
+		{"type": "spot", "position": [0, 64, 0], "direction": [1, 0, 0], "color": [1, 1, 1],
+			"intensity": 3, "range": 320, "innerDegrees": 20, "outerDegrees": 40, "castsShadow": false},
+		{"type": "spot", "position": [0, 0, 0], "direction": [0, -1, 0], "color": [1, 1, 1],
+			"intensity": 1, "range": 32, "innerDegrees": 40, "outerDegrees": 40, "castsShadow": false},
+	]})
+	var level := _level(path)
+	level.load_level(path)
+	var spots := _of(level, "SpotLight3D")
+	var spot := spots[0] as SpotLight3D if spots.size() == 2 else null
+	_check(spot != null and is_equal_approx(spot.spot_angle, 40.0) and is_equal_approx(spot.spot_range, 10.0),
+		"spot: outer angle and range in metres")
+	_check(spot != null and is_equal_approx(spot.spot_angle_attenuation, 0.2 / 0.5 - 0.1),
+		"spot: inner cone becomes Godot's angular attenuation")
+	_check(spot != null and _near(-spot.basis.z, Vector3.RIGHT), "spot: shines along its direction")
+	_check(spots.size() == 2 and is_finite((spots[1] as SpotLight3D).spot_angle_attenuation),
+		"spot: a hard edge (inner = outer) stays finite")
+	level.free()
+
+func _test_textured_and_broken() -> void:
+	print("level: textured and broken modules")
+	var dir := "user://voxigen_tests/textured"
+	Fixtures.write_level(dir)
+	Fixtures.write_textured_glb(dir.path_join("modules/tile.glb"), 32.0)
+	Fixtures.write_broken_glb(dir.path_join("modules/broken.glb"))
+	var path := Fixtures.write_manifest(dir, {
+		"modules": [
+			{"name": "tile", "file": "modules/tile.glb"},
+			{"name": "broken", "file": "modules/broken.glb"},
+		],
+		"placements": [
+			{"module": "tile", "position": [0, 0, 0], "rotation": [0, 0, 0, 1]},
+			{"module": "broken", "position": [32, 0, 0], "rotation": [0, 0, 0, 1]},
+		],
+	})
+	var level := _level(path)
+	var placed := level.load_level(path)
+	var tile := level.get_node_or_null("tile_0_0_0") as MultiMeshInstance3D
+	var material := tile.multimesh.mesh.surface_get_material(0) as BaseMaterial3D if tile else null
+	_check(material != null and material.albedo_texture != null and not material.vertex_color_use_as_albedo,
+		"a textured module keeps its texture, without vertex colour")
+	_check(placed == 1 and level.get_node_or_null("broken_1_0_0") == null,
+		"a module that fails to load is skipped, the rest still built")
 	level.free()

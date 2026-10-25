@@ -11,7 +11,7 @@ extends Node3D
 ## handful of draw calls rather than 400. The manifest states everything in
 ## voxels; this node turns voxels into metres with [member voxel_size_m].
 ##
-## The format is described in FORMAT.md, next to this add-on's README.
+## The format: https://github.com/nikolatec/voxigen-godot-importer/blob/main/FORMAT.md
 
 ## Emitted once the level is built, with how many modules and placements it has.
 signal level_loaded(modules: int, placements: int)
@@ -26,12 +26,12 @@ const MAX_VERSION := 3
 ## The level.json to build. Paths inside it are relative to it, so a level
 ## folder can be moved without editing the file. It may live under res:// (its
 ## GLBs imported by Godot) or anywhere on disk, user:// included (its GLBs read
-## at runtime) — the second is how a game loads levels its players made.
+## at runtime) — the second is how a game loads levels its players made, so
+## nothing in a manifest is trusted: a malformed entry is skipped with a warning.
 @export_file("*.json") var manifest_path: String = "":
 	set(value):
 		manifest_path = value
-		if is_inside_tree() and Engine.is_editor_hint():
-			_preview()
+		_changed()
 
 ## Build [member manifest_path] when this node enters the tree. Off for a game
 ## that picks its level itself and calls [method load_level].
@@ -42,26 +42,31 @@ const MAX_VERSION := 3
 @export var voxel_size_m: float = 1.0 / 32.0:
 	set(value):
 		voxel_size_m = maxf(value, 0.0001)
-		if is_inside_tree() and Engine.is_editor_hint():
-			_preview()
+		_changed()
 
 ## Modules whose name starts with this are markers, not geometry: a spawn, a
 ## pickup, a trigger. In VoxiGen a marker is a small model titled, say,
 ## "marker_spawn_player", placed like any module. It is not drawn and does not
 ## collide; it becomes a Marker3D and is reported by [signal marker_found].
 ## Empty: every module is geometry.
-@export var marker_prefix: String = "marker_"
+@export var marker_prefix: String = "marker_":
+	set(value):
+		marker_prefix = value
+		_changed()
 
 ## Build placements into cells this size (metres), one batch per module per
 ## cell, so Godot can skip what is off screen and switch level of detail per
 ## cell. Smaller cells cull finer but make more batches: VOXEN's 390 m
 ## demo_halls is 31 batches whole, 606 at 32 m, 1071 at 16 m. 0: one batch per
 ## module for the whole level, drawn in full every frame.
-@export var chunk_size_m: float = 32.0
+@export var chunk_size_m: float = 32.0:
+	set(value):
+		chunk_size_m = maxf(value, 0.0)
+		_changed()
 
 @export_group("Collision")
 ## Give the level static collision: each module's mesh as a trimesh shape,
-## built once and shared by every placement.
+## built once and shared by every placement. Not built in the editor preview.
 @export var collision: bool = true
 @export_flags_3d_physics var collision_layer: int = 1
 @export_flags_3d_physics var collision_mask: int = 1
@@ -69,24 +74,39 @@ const MAX_VERSION := 3
 @export_group("Lights")
 ## What VoxiGen's light intensity is worth as Godot light energy. VoxiGen's
 ## number belongs to its own renderer, so calibrate it here by eye.
-@export var light_energy_scale: float = 1.0
+@export var light_energy_scale: float = 1.0:
+	set(value):
+		light_energy_scale = value
+		_changed()
 ## Multiplies every light's range. Below 1, fewer lights overlap any surface.
-@export var light_range_scale: float = 1.0
+@export var light_range_scale: float = 1.0:
+	set(value):
+		light_range_scale = value
+		_changed()
 ## Shadowed point and spot lights cast their shadow only this near the camera
 ## (metres), fading out past it; their light still reaches any distance. A
 ## shadowed omni light redraws what it reaches six times a frame, so a room of
 ## torches is expensive without this. 0: shadows at any distance.
-@export var shadow_distance_m: float = 0.0
+@export var shadow_distance_m: float = 0.0:
+	set(value):
+		shadow_distance_m = maxf(value, 0.0)
+		_changed()
 
 @export_group("Level of detail")
 ## Where the export's coarser meshes take over (metres from the camera): x for
 ## half the voxels, y for a quarter. Used only for modules exported with level
-## of detail. (0, 0): always draw the full meshes.
-@export var lod_distances_m: Vector2 = Vector2.ZERO
+## of detail, and measured to the centre of each chunk, so it needs
+## [member chunk_size_m] above 0. (0, 0): always draw the full meshes.
+@export var lod_distances_m: Vector2 = Vector2.ZERO:
+	set(value):
+		lod_distances_m = value
+		_changed()
 
-## Mesh and collision faces per module file, for this node's levels.
+## Per load_level: meshes and collision shapes by module file, so placements
+## of a module share them. Emptied on every load, so a level re-exported to the
+## same path is read again.
 var _meshes: Dictionary = {}
-var _faces: Dictionary = {}
+var _shapes: Dictionary = {}
 
 func _ready() -> void:
 	if Engine.is_editor_hint():
@@ -98,15 +118,21 @@ func _ready() -> void:
 ## how many placements were built: 0 for a level that could not be read.
 func load_level(path: String) -> int:
 	clear()
+	_meshes.clear()
+	_shapes.clear()
 	var manifest := _read_manifest(path)
 	if manifest.is_empty():
 		return 0
+	if lod_distances_m.x > 0.0 and chunk_size_m <= 0.0:
+		push_warning("VoxiGenLevel: level of detail needs chunk_size_m above 0; with one batch per module, every module switches at once")
 
 	var base_dir := path.get_base_dir()
 	var meshes := {}  # module name -> [full, lod1, lod2] (lods may be null)
+	var failed := {}  # module names whose GLB did not load
 	var module_lights := {}
-	for entry: Variant in manifest.get("modules", []):
+	for entry: Variant in _array(manifest.get("modules")):
 		if typeof(entry) != TYPE_DICTIONARY:
+			push_warning("VoxiGenLevel: a module entry that is not an object was skipped")
 			continue
 		var module := entry as Dictionary
 		var name := str(module.get("name", ""))
@@ -119,35 +145,42 @@ func load_level(path: String) -> int:
 		var full_path := _resolve(base_dir, file)
 		var mesh := _load_mesh(full_path)
 		if mesh == null:
+			failed[name] = true
 			continue
 		var lods: Array = [mesh, null, null]
-		var named: Array = module.get("lods", [])
+		var named := _array(module.get("lods"))
 		for k in [1, 2]:
-			var lod_path := _resolve(base_dir, str(named[k - 1])) if named.size() >= k \
-				else full_path.trim_suffix(".glb") + ".lod%d.glb" % k
+			var lod_path := full_path.trim_suffix(".glb") + ".lod%d.glb" % k
+			if named.size() >= k:
+				lod_path = _resolve(base_dir, str(named[k - 1]))
 			if _file_exists(lod_path):
 				lods[k] = _load_mesh(lod_path)
 		meshes[name] = lods
-		var carried: Variant = module.get("lights", [])
-		if carried is Array and not (carried as Array).is_empty():
+		var carried := _array(module.get("lights"))
+		if not carried.is_empty():
 			module_lights[name] = carried
 
 	# Placements, grouped by module and cell: a MultiMesh draws one mesh.
 	var batches := {}  # [module, cell] -> Array[Transform3D]
 	var placed := 0
-	var markers := 0
-	for entry: Variant in manifest.get("placements", []):
+	for entry: Variant in _array(manifest.get("placements")):
 		if typeof(entry) != TYPE_DICTIONARY:
+			push_warning("VoxiGenLevel: a placement that is not an object was skipped")
 			continue
 		var placement := entry as Dictionary
 		var module := str(placement.get("module", ""))
-		var pose := _pose_of(placement)
+		var position := _numbers(placement.get("position"), 3)
+		var rotation := _numbers(placement.get("rotation"), 4)
+		if position.is_empty() or rotation.is_empty():
+			push_warning("VoxiGenLevel: a placement of '%s' with a malformed position or rotation was skipped" % module)
+			continue
+		var pose := _pose_of(position, rotation)
 		if _is_marker(module):
 			_add_marker(module, _rigid(pose))
-			markers += 1
 			continue
 		if not meshes.has(module):
-			push_warning("VoxiGenLevel: a placement names unknown module '%s'; skipped" % module)
+			if not failed.has(module):
+				push_warning("VoxiGenLevel: a placement names unknown module '%s'; skipped" % module)
 			continue
 		var key := [module, _cell_of(pose.origin)]
 		if not batches.has(key):
@@ -155,15 +188,13 @@ func load_level(path: String) -> int:
 		batches[key].append(pose)
 		placed += 1
 		for light: Variant in module_lights.get(module, []):
-			if typeof(light) == TYPE_DICTIONARY:
-				_add_light(light as Dictionary, _rigid(pose))
+			_add_light(light, _rigid(pose))
 
 	for key: Array in batches:
 		_add_batch(key[0], key[1], meshes[key[0]], batches[key])
 
-	for light: Variant in manifest.get("lights", []):
-		if typeof(light) == TYPE_DICTIONARY:
-			_add_light(light as Dictionary)
+	for light: Variant in _array(manifest.get("lights")):
+		_add_light(light)
 
 	level_loaded.emit(meshes.size(), placed)
 	return placed
@@ -174,6 +205,10 @@ func clear() -> void:
 		if child.has_meta("voxigen_level"):
 			remove_child(child)
 			child.queue_free()
+
+func _changed() -> void:
+	if is_inside_tree() and Engine.is_editor_hint():
+		_preview()
 
 func _preview() -> void:
 	# In the editor the level is drawn for a look, not saved into the scene:
@@ -192,7 +227,7 @@ func _read_manifest(path: String) -> Dictionary:
 		push_error("VoxiGenLevel: %s is not a level manifest" % path)
 		return {}
 	var manifest := parsed as Dictionary
-	var version := int(manifest.get("version", 0))
+	var version := int(manifest.get("version", 0)) if typeof(manifest.get("version")) in [TYPE_INT, TYPE_FLOAT] else 0
 	if version < 1:
 		push_error("VoxiGenLevel: %s has no version; is it a VoxiGen level.json?" % path)
 		return {}
@@ -203,6 +238,23 @@ func _read_manifest(path: String) -> Dictionary:
 			% [path, version, MAX_VERSION])
 		return {}
 	return manifest
+
+# A manifest field that should be an array: itself, or empty if it is missing
+# or anything else.
+func _array(value: Variant) -> Array:
+	return value as Array if value is Array else []
+
+# `count` numbers from a manifest array, or an empty array if it is not exactly
+# that: a short or mistyped vector is skipped, never read as zeros.
+func _numbers(value: Variant, count: int) -> PackedFloat64Array:
+	var out := PackedFloat64Array()
+	if not value is Array or (value as Array).size() != count:
+		return out
+	for item: Variant in value:
+		if typeof(item) != TYPE_INT and typeof(item) != TYPE_FLOAT:
+			return PackedFloat64Array()
+		out.append(float(item))
+	return out
 
 func _resolve(base_dir: String, file: String) -> String:
 	return base_dir.path_join(file).simplify_path()
@@ -219,7 +271,8 @@ func _in_project(path: String) -> bool:
 # A module GLB's mesh, ready to draw. Godot's importer leaves glTF vertex colour
 # unmultiplied — VoxiGen writes colour as COLOR_0 over a white base colour, and
 # without vertex_color_use_as_albedo every module draws white — so the mesh is
-# copied with its materials told to use it.
+# copied with its materials told to use it. A textured export carries no
+# vertex colour and is left as it is.
 func _load_mesh(path: String) -> Mesh:
 	if _meshes.has(path):
 		return _meshes[path]
@@ -234,7 +287,7 @@ func _load_mesh(path: String) -> Mesh:
 		if document.append_from_file(path, state) == OK:
 			root = document.generate_scene(state)
 	if root == null:
-		push_error("VoxiGenLevel: could not load module %s" % path)
+		push_error("VoxiGenLevel: module %s failed to load; its placements are skipped" % path)
 		_meshes[path] = null
 		return null
 	var found := root.find_children("*", "MeshInstance3D", true, false)
@@ -245,13 +298,13 @@ func _load_mesh(path: String) -> Mesh:
 		push_warning("VoxiGenLevel: module %s holds %d meshes; only the first is used" % [path, found.size()])
 	root.free()
 	if source == null:
-		push_error("VoxiGenLevel: module %s has no mesh" % path)
+		push_error("VoxiGenLevel: module %s has no mesh; its placements are skipped" % path)
 		_meshes[path] = null
 		return null
 	var mesh := source.duplicate() as Mesh
 	for i in mesh.get_surface_count():
 		var material := mesh.surface_get_material(i) as BaseMaterial3D
-		if material:
+		if material and mesh.surface_get_format(i) & Mesh.ARRAY_FORMAT_COLOR:
 			material = material.duplicate() as BaseMaterial3D
 			material.vertex_color_use_as_albedo = true
 			mesh.surface_set_material(i, material)
@@ -260,13 +313,12 @@ func _load_mesh(path: String) -> Mesh:
 
 # Voxels to metres, and the manifest's xyzw quaternion to a basis. The scale is
 # in the pose so a placement draws at its size; collision gets rigid poses and
-# faces already in metres instead (_add_batch), since physics shapes should not
-# be scaled.
-func _pose_of(placement: Dictionary) -> Transform3D:
-	var p: Array = placement.get("position", [0, 0, 0])
-	var q: Array = placement.get("rotation", [0, 0, 0, 1])
-	var rotation := Quaternion(float(q[0]), float(q[1]), float(q[2]), float(q[3])).normalized()
-	var origin := Vector3(float(p[0]), float(p[1]), float(p[2])) * voxel_size_m
+# a shape already in metres instead (_shape_of), since physics shapes should
+# not be scaled.
+func _pose_of(p: PackedFloat64Array, q: PackedFloat64Array) -> Transform3D:
+	var rotation := Quaternion(q[0], q[1], q[2], q[3])
+	rotation = rotation.normalized() if rotation.length_squared() > 0.0 else Quaternion.IDENTITY
+	var origin := Vector3(p[0], p[1], p[2]) * voxel_size_m
 	return Transform3D(Basis(rotation).scaled(Vector3.ONE * voxel_size_m), origin)
 
 func _rigid(pose: Transform3D) -> Transform3D:
@@ -318,15 +370,17 @@ func _add_batch(module: String, cell: Vector3i, lods: Array, poses: Array) -> vo
 					node.visibility_range_end = far
 				2:
 					node.visibility_range_begin = lod_distances_m.y
+			# A metre of hysteresis, so a camera standing on a switch distance
+			# does not flicker between details.
+			node.visibility_range_begin_margin = 1.0 if node.visibility_range_begin > 0.0 else 0.0
+			node.visibility_range_end_margin = 1.0 if node.visibility_range_end > 0.0 else 0.0
 		_own(node)
 
 	if not collision or Engine.is_editor_hint():
 		return
-	var faces := _faces_of(lods[0])
-	if faces.is_empty():
+	var shape := _shape_of(lods[0])
+	if shape == null:
 		return
-	var shape := ConcavePolygonShape3D.new()
-	shape.set_faces(faces)
 	var body := StaticBody3D.new()
 	body.name = module + suffix + "_collision"
 	body.collision_layer = collision_layer
@@ -338,39 +392,52 @@ func _add_batch(module: String, cell: Vector3i, lods: Array, poses: Array) -> vo
 		body.add_child(collider)
 	_own(body)
 
-# A module's triangles in metres, once per mesh: the shape every placement of
-# it shares, unscaled, at a rigid pose.
-func _faces_of(mesh: Mesh) -> PackedVector3Array:
-	var key := [mesh, voxel_size_m]  # in metres, so per scale
-	if _faces.has(key):
-		return _faces[key]
+# A module's collision shape, in metres: built once per mesh and shared by every
+# placement in every chunk, unscaled, at rigid poses.
+func _shape_of(mesh: Mesh) -> ConcavePolygonShape3D:
+	if _shapes.has(mesh):
+		return _shapes[mesh]
 	var faces := mesh.get_faces()
 	for i in faces.size():
 		faces[i] *= voxel_size_m
-	_faces[key] = faces
-	return faces
+	var shape: ConcavePolygonShape3D = null
+	if not faces.is_empty():
+		shape = ConcavePolygonShape3D.new()
+		shape.set_faces(faces)
+	_shapes[mesh] = shape
+	return shape
 
 # A light in voxels, right-handed: the level's own in the placements' frame, or
 # a module's in its GLB's frame with `at` the placement carrying it. Godot's
 # lights shine down their own -Z, so spot and directional lights are turned to
 # look along the manifest's direction.
-func _add_light(light: Dictionary, at: Transform3D = Transform3D.IDENTITY) -> Light3D:
+func _add_light(entry: Variant, at: Transform3D = Transform3D.IDENTITY) -> Light3D:
+	if typeof(entry) != TYPE_DICTIONARY:
+		push_warning("VoxiGenLevel: a light that is not an object was skipped")
+		return null
+	var light := entry as Dictionary
 	var type := str(light.get("type", ""))
+	var position := _numbers(light.get("position", [0, 0, 0]), 3)
+	var direction := _numbers(light.get("direction", [0, -1, 0]), 3)
+	var color := _numbers(light.get("color", [1, 1, 1]), 3)
+	if position.is_empty() or direction.is_empty() or color.is_empty():
+		push_warning("VoxiGenLevel: a %s light with a malformed position, direction or colour was skipped" % type)
+		return null
 	var node: Light3D
 	match type:
 		"point":
 			var omni := OmniLight3D.new()
-			omni.omni_range = float(light.get("range", 0.0)) * voxel_size_m * light_range_scale
+			omni.omni_range = _number(light, "range", 0.0) * voxel_size_m * light_range_scale
 			node = omni
 		"spot":
 			var spot := SpotLight3D.new()
-			spot.spot_range = float(light.get("range", 0.0)) * voxel_size_m * light_range_scale
-			spot.spot_angle = float(light.get("outerDegrees", 45.0))
+			spot.spot_range = _number(light, "range", 0.0) * voxel_size_m * light_range_scale
+			spot.spot_angle = clampf(_number(light, "outerDegrees", 45.0), 0.0, 180.0)
 			# Godot has angular attenuation rather than an inner cone; this is
 			# the approximation its own glTF light importer uses.
 			if light.has("innerDegrees"):
 				var outer := spot.spot_angle
-				var inner := clampf(float(light["innerDegrees"]), 0.0, outer)
+				var inner := clampf(_number(light, "innerDegrees", 0.0), 0.0, outer)
 				var ratio := inner / outer if outer > 0.0 else 0.0
 				spot.spot_angle_attenuation = 0.2 / maxf(1.0 - ratio, 0.000001) - 0.1
 			node = spot
@@ -379,20 +446,17 @@ func _add_light(light: Dictionary, at: Transform3D = Transform3D.IDENTITY) -> Li
 		_:
 			push_warning("VoxiGenLevel: a light of unknown type '%s' was skipped" % type)
 			return null
-	var c: Array = light.get("color", [1, 1, 1])
-	node.light_color = Color(float(c[0]), float(c[1]), float(c[2]))
-	node.light_energy = float(light.get("intensity", 1.0)) * light_energy_scale
-	node.shadow_enabled = bool(light.get("castsShadow", false))
+	node.light_color = Color(color[0], color[1], color[2])
+	node.light_energy = _number(light, "intensity", 1.0) * light_energy_scale
+	node.shadow_enabled = light.get("castsShadow", false) == true
 	if node.shadow_enabled and type != "directional" and shadow_distance_m > 0.0:
 		node.distance_fade_enabled = true
 		node.distance_fade_shadow = shadow_distance_m
 		node.distance_fade_begin = 100000.0
 		node.distance_fade_length = maxf(shadow_distance_m * 0.25, 0.01)
-	var p: Array = light.get("position", [0, 0, 0])
-	node.position = Vector3(float(p[0]), float(p[1]), float(p[2])) * voxel_size_m
+	node.position = Vector3(position[0], position[1], position[2]) * voxel_size_m
 	if type != "point":
-		var d: Array = light.get("direction", [0, -1, 0])
-		var dir := Vector3(float(d[0]), float(d[1]), float(d[2])).normalized()
+		var dir := Vector3(direction[0], direction[1], direction[2]).normalized()
 		if dir.length() > 0.0:
 			var up := Vector3.UP if absf(dir.dot(Vector3.UP)) < 0.99 else Vector3.FORWARD
 			node.basis = Basis.looking_at(dir, up)
@@ -400,3 +464,7 @@ func _add_light(light: Dictionary, at: Transform3D = Transform3D.IDENTITY) -> Li
 	node.name = type + "_light"
 	_own(node)
 	return node
+
+func _number(from: Dictionary, key: String, fallback: float) -> float:
+	var value: Variant = from.get(key, fallback)
+	return float(value) if typeof(value) == TYPE_INT or typeof(value) == TYPE_FLOAT else fallback
