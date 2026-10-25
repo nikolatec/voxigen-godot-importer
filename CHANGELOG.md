@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.0 — unreleased
+## 1.0.0 — 2026-10-25
 
 - `VoxiGenLevel` node: builds a VoxiGen `level.json` (versions 1–3) with
   batched modules per chunk, vertex colours, module and level lights, markers,
