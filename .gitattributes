@@ -1,0 +1,5 @@
+# Only the add-on goes into Asset Store / "Download ZIP" archives.
+/tests export-ignore
+/project.godot export-ignore
+/.gitignore export-ignore
+/.gitattributes export-ignore

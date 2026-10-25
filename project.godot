@@ -1,0 +1,13 @@
+; The add-on's development project: tests and the example. Users copy only
+; addons/voxigen_level into their own project.
+
+config_version=5
+
+[application]
+
+config/name="VoxiGen Level Importer"
+config/features=PackedStringArray("4.7")
+
+[editor_plugins]
+
+enabled=PackedStringArray("res://addons/voxigen_level/plugin.cfg")
