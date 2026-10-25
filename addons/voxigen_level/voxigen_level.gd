@@ -23,6 +23,13 @@ signal marker_found(marker: String, at: Transform3D)
 ## The newest manifest version this importer reads. Older ones are read too.
 const MAX_VERSION := 3
 
+## Fade distances (metres) the importer tries for a level's lights, farthest
+## first; it takes the first that keeps [member light_budget].
+const LIGHT_FADE_STEPS: Array[float] = [96.0, 80.0, 64.0, 48.0, 40.0, 32.0, 24.0, 20.0, 16.0, 12.0, 8.0]
+
+## A light whose shadow alone fades (shadow_distance_m) keeps its light out to here.
+const NO_LIGHT_FADE_M := 100000.0
+
 ## The largest number a manifest may state, in voxels or any other unit. Godot
 ## keeps positions in 32-bit floats, so a value that is finite here (1e300) can
 ## still become infinite in a transform; a billion voxels is far past any level.
@@ -106,6 +113,37 @@ const MAX_MAGNITUDE := 1.0e9
 		shadow_distance_m = maxf(value, 0.0)
 		_changed()
 
+## On the Mobile and Compatibility renderers, how many lights may be within
+## the fade's reach of any spot in the level. A web export (Compatibility,
+## WebGL 2) with too many lights does not drop the farthest: it renders nearly
+## black, with no error. VOXEN's demo_halls on Chrome and Safari stayed lit
+## with about 96 lights near the camera, went partly dark around 112 and black
+## from 128. Lights fade out past a distance chosen so no spot has more than
+## this many within reach. 0: no fade.
+@export_range(0, 256) var light_budget: int = 80:
+	set(value):
+		light_budget = maxi(value, 0)
+		_apply_light_fade()
+## Where the light fade applies. Auto: on Mobile and Compatibility, as decided
+## by the renderer the game runs on, so one level suits every export and
+## Forward+ keeps every light. Always: on every renderer. Never: off.
+@export_enum("Auto", "Always", "Never") var light_fade_mode: int = 0:
+	set(value):
+		light_fade_mode = value
+		_apply_light_fade()
+## Lights fade out past this distance from the camera (metres). 0: chosen from
+## the level's own lights to keep [member light_budget].
+@export var light_fade_distance_m: float = 0.0:
+	set(value):
+		light_fade_distance_m = maxf(value, 0.0)
+		_apply_light_fade()
+## How far a light takes to fade out (metres), so lights do not pop as the
+## camera moves.
+@export var light_fade_length_m: float = 10.0:
+	set(value):
+		light_fade_length_m = maxf(value, 0.0)
+		_apply_light_fade()
+
 @export_group("Level of detail")
 ## Where the export's coarser meshes take over (metres from the camera): x for
 ## half the voxels, y for a quarter. Used only for modules exported with level
@@ -122,6 +160,12 @@ const MAX_MAGNITUDE := 1.0e9
 var _meshes: Dictionary = {}
 var _shapes: Dictionary = {}
 var _rebuild_pending := false
+## Point and spot lights the level built: what the light fade applies to.
+var _positional_lights: Array[Light3D] = []
+## The distance lights fade out past, as last applied; 0 when they do not.
+var light_fade_applied_m := 0.0
+## Stands in for the renderer the game runs on (tests).
+var _rendering_method_override := ""
 
 func _ready() -> void:
 	if Engine.is_editor_hint():
@@ -215,15 +259,102 @@ func load_level(path: String) -> int:
 	for light: Variant in _array(manifest.get("lights")):
 		_add_light(light)
 
+	for child in get_children():
+		if child.has_meta("voxigen_level") and (child is OmniLight3D or child is SpotLight3D):
+			_positional_lights.append(child)
+	_apply_light_fade()
+	if not light_fade_active() and light_budget > 0 and _positional_lights.size() > light_budget \
+			and _rendering_method() != "forward_plus" and not Engine.is_editor_hint():
+		push_warning("VoxiGenLevel: %d lights on the %s renderer with the light fade off; past %d in view, lights go missing and the level can render dark." \
+			% [_positional_lights.size(), _rendering_method(), light_budget])
+
 	level_loaded.emit(meshes.size(), placed)
 	return placed
 
 ## Removes the level this node built.
 func clear() -> void:
+	_positional_lights.clear()
+	light_fade_applied_m = 0.0
 	for child in get_children():
 		if child.has_meta("voxigen_level"):
 			remove_child(child)
 			child.queue_free()
+
+## True when lights fade with distance here: on Mobile or Compatibility under
+## Auto, on any renderer under Always; never in the editor, which shows the
+## level as built.
+func light_fade_active() -> bool:
+	if Engine.is_editor_hint() or light_budget <= 0 or light_fade_mode == 2:
+		return false
+	return light_fade_mode == 1 or _rendering_method() != "forward_plus"
+
+func _rendering_method() -> String:
+	if not _rendering_method_override.is_empty():
+		return _rendering_method_override
+	return RenderingServer.get_current_rendering_method()
+
+# Sets every light's distance fade from the current settings. It shares
+# Godot's distance fade with shadow_distance_m: that fades only the shadow
+# (distance_fade_shadow, never touched here), so turning the light fade off
+# puts back the shadow-only fade rather than none.
+func _apply_light_fade() -> void:
+	var distance := 0.0
+	if light_fade_active() and not _positional_lights.is_empty():
+		distance = light_fade_distance_m if light_fade_distance_m > 0.0 else fade_distance_for(light_budget)
+	light_fade_applied_m = distance
+	for light in _positional_lights:
+		if not is_instance_valid(light):
+			continue
+		if distance > 0.0:
+			light.distance_fade_enabled = true
+			light.distance_fade_begin = distance
+			light.distance_fade_length = maxf(light_fade_length_m, 0.01)
+		elif light.get_meta("voxigen_shadow_fade", false):
+			light.distance_fade_enabled = true
+			light.distance_fade_begin = NO_LIGHT_FADE_M
+			light.distance_fade_length = maxf(shadow_distance_m * 0.25, 0.01)
+		else:
+			light.distance_fade_enabled = false
+
+## The farthest of [constant LIGHT_FADE_STEPS] at which no light of this level
+## has more than [param budget] lights (itself included) within the fade's
+## reach, counting the fade length. A camera stands near some light, so that
+## bounds what it can see. The nearest step, with a warning, when none fits.
+func fade_distance_for(budget: int) -> float:
+	var positions := PackedVector3Array()
+	for light in _positional_lights:
+		positions.append(light.position)
+	var crowd := 0
+	for step: float in LIGHT_FADE_STEPS:
+		crowd = _most_within(positions, step + light_fade_length_m)
+		if crowd <= budget:
+			return step
+	var nearest: float = LIGHT_FADE_STEPS[-1]
+	push_warning("VoxiGenLevel: up to %d lights within %d m of one another; above light_budget (%d) even at the nearest fade. Some lights will go missing on Mobile and Compatibility." \
+		% [crowd, int(nearest + light_fade_length_m), budget])
+	return nearest
+
+# The most points within `reach` of any one of them, itself included, found
+# through a grid of `reach`-sized cells: only neighbouring cells can hold one.
+func _most_within(points: PackedVector3Array, reach: float) -> int:
+	var cells := {}
+	for i in points.size():
+		var key := Vector3i((points[i] / reach).floor())
+		if not cells.has(key):
+			cells[key] = PackedInt32Array()
+		cells[key].append(i)
+	var most := 0
+	for i in points.size():
+		var home := Vector3i((points[i] / reach).floor())
+		var count := 0
+		for dx in [-1, 0, 1]:
+			for dy in [-1, 0, 1]:
+				for dz in [-1, 0, 1]:
+					for j: int in cells.get(home + Vector3i(dx, dy, dz), PackedInt32Array()):
+						if points[i].distance_to(points[j]) <= reach:
+							count += 1
+		most = maxi(most, count)
+	return most
 
 func _changed() -> void:
 	# Once per frame however many settings change in it: dragging a slider in
@@ -484,9 +615,10 @@ func _add_light(entry: Variant, at: Transform3D = Transform3D.IDENTITY) -> Light
 	node.light_energy = energy
 	node.shadow_enabled = casts_shadow
 	if node.shadow_enabled and type != "directional" and shadow_distance_m > 0.0:
+		node.set_meta("voxigen_shadow_fade", true)
 		node.distance_fade_enabled = true
 		node.distance_fade_shadow = shadow_distance_m
-		node.distance_fade_begin = 100000.0
+		node.distance_fade_begin = NO_LIGHT_FADE_M
 		node.distance_fade_length = maxf(shadow_distance_m * 0.25, 0.01)
 	node.position = Vector3(position[0], position[1], position[2]) * voxel_size_m
 	if type != "point":

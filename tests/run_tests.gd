@@ -9,7 +9,7 @@ extends SceneTree
 const Fixtures := preload("res://tests/fixtures.gd")
 const S := 1.0 / 32.0
 ## Raise it when adding checks.
-const MIN_CHECKS := 62
+const MIN_CHECKS := 70
 
 var failures := 0
 var checks := 0
@@ -28,6 +28,7 @@ func _initialize() -> void:
 	_test_malformed()
 	_test_shared_shapes()
 	_test_spot()
+	_test_light_fade()
 	_test_textured_and_broken()
 	_test_hostile()
 	# A script error (the add-on failing to compile, say) skips checks rather
@@ -273,6 +274,48 @@ func _test_spot() -> void:
 	_check(spot != null and _near(-spot.basis.z, Vector3.RIGHT), "spot: shines along its direction")
 	_check(spots.size() == 2 and is_finite((spots[1] as SpotLight3D).spot_angle_attenuation),
 		"spot: a hard edge (inner = outer) stays finite")
+	level.free()
+
+func _test_light_fade() -> void:
+	print("level: light fade")
+	var dir := "user://voxigen_tests/light_fade"
+	Fixtures.write_level(dir)
+	# Ten lights in a row, 10 m (320 voxels) apart; the first casts a shadow.
+	var lights := []
+	for i in 10:
+		lights.append({"type": "point", "position": [i * 320, 32, 0], "color": [1, 1, 1], "range": 128,
+			"castsShadow": i == 0})
+	var path := Fixtures.write_manifest(dir, {"lights": lights})
+	var level := _level(path, {"light_budget": 3, "light_fade_length_m": 2.0, "shadow_distance_m": 12.0})
+	level._rendering_method_override = "gl_compatibility"
+	level.load_level(path)
+	var omni := _of(level, "OmniLight3D")
+	_check(level.light_fade_active(), "Auto fades lights on Compatibility")
+	# 16 m (+2 m of fade) reaches a light's two neighbours; 20 m would reach four.
+	_check(is_equal_approx(level.light_fade_applied_m, 16.0), "fades from the farthest distance that keeps the budget")
+	_check(omni.size() == 10 and omni.all(func(l: OmniLight3D) -> bool: return l.distance_fade_enabled \
+		and is_equal_approx(l.distance_fade_begin, 16.0) and is_equal_approx(l.distance_fade_length, 2.0)),
+		"every light fades from there")
+	var shadowed := omni.filter(func(l: OmniLight3D) -> bool: return l.shadow_enabled)
+	_check(shadowed.size() == 1 and is_equal_approx((shadowed[0] as OmniLight3D).distance_fade_shadow, 12.0),
+		"the shadow fade is kept alongside")
+	level.light_fade_distance_m = 30.0
+	_check(is_equal_approx(level.light_fade_applied_m, 30.0) and is_equal_approx((omni[3] as OmniLight3D).distance_fade_begin, 30.0),
+		"a set distance overrides the computed one")
+	level.light_fade_mode = 2
+	_check(not level.light_fade_active() and is_equal_approx(level.light_fade_applied_m, 0.0) \
+		and omni.filter(func(l: OmniLight3D) -> bool: return not l.shadow_enabled).all(
+			func(l: OmniLight3D) -> bool: return not l.distance_fade_enabled),
+		"Never turns the fade back off")
+	var shadow := shadowed[0] as OmniLight3D
+	_check(shadow.distance_fade_enabled and shadow.distance_fade_begin > 1000.0 and is_equal_approx(shadow.distance_fade_shadow, 12.0),
+		"Never puts the shadow-only fade back")
+	level.light_fade_mode = 0
+	level._rendering_method_override = "forward_plus"
+	level.load_level(path)
+	_check(not level.light_fade_active() and _of(level, "OmniLight3D").all(
+		func(l: OmniLight3D) -> bool: return l.shadow_enabled or not l.distance_fade_enabled),
+		"Auto leaves Forward+ as built")
 	level.free()
 
 func _test_textured_and_broken() -> void:

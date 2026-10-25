@@ -67,6 +67,22 @@ can render slightly differently. If you use VoxiGen's LODs (`lod_distances_m`),
 turn off **Meshes → Generate LODs** in the import settings of the `modules`
 folder so the two kinds don't stack.
 
+### Web, Mobile and Compatibility
+
+A Godot web export runs the Compatibility renderer (WebGL 2), and a level
+with more than about a hundred lights near the camera renders nearly black
+there: the lighting fails as a whole, with no error. VOXEN's demo_halls (331
+lights) stayed lit in Chrome and Safari with about 96 lights near the camera,
+went partly dark around 112 and black from 128. Smaller chunks and a higher
+`rendering/limits/opengl/max_renderable_lights` did not help.
+
+So on Mobile and Compatibility the importer fades lights out with distance
+from the camera, decided by the renderer the game runs on: one imported level
+works on every export, and Forward+ keeps every light. The fade distance is
+chosen from the level's own lights so no spot has more than `light_budget`
+(80) within reach; demo_halls gets 24 m. Set `light_fade_distance_m` to choose
+it yourself, or `light_fade_mode` to Always or Never.
+
 Levels loaded at runtime are read as untrusted input: a malformed module,
 placement or light is skipped with a warning instead of being built wrong, and
 modules must sit inside the level's own folder (`confine_to_level_folder`).
@@ -84,6 +100,9 @@ modules must sit inside the level's own folder (`confine_to_level_folder`).
 | `collision`, `collision_layer`, `collision_mask` | on, 1, 1 | Static trimesh collision. |
 | `light_energy_scale`, `light_range_scale` | `1`, `1` | Calibrate VoxiGen's light intensity and range for your renderer. |
 | `shadow_distance_m` | `0` | Shadowed point/spot lights cast shadows only this near the camera. `0`: always. |
+| `light_budget` | `80` | On Mobile and Compatibility, the most lights within the fade's reach of any spot. 0: no fade. |
+| `light_fade_mode` | Auto | Auto: fade on Mobile and Compatibility only. Always, Never. |
+| `light_fade_distance_m`, `light_fade_length_m` | `0`, `10` | Where lights start fading (0: chosen from the level) and how far they take to fade out. |
 | `lod_distances_m` | `(0, 0)` | Where half-detail (x) and quarter-detail (y) meshes take over, measured to each chunk's centre — so it needs `chunk_size_m` above 0. `(0, 0)`: off. |
 
 Signals: `level_loaded(modules, placements)` and `marker_found(marker, at)`.
