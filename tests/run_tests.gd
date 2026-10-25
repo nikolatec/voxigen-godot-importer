@@ -9,7 +9,7 @@ extends SceneTree
 const Fixtures := preload("res://tests/fixtures.gd")
 const S := 1.0 / 32.0
 ## Raise it when adding checks.
-const MIN_CHECKS := 62
+const MIN_CHECKS := 69
 
 var failures := 0
 var checks := 0
@@ -28,6 +28,7 @@ func _initialize() -> void:
 	_test_malformed()
 	_test_shared_shapes()
 	_test_spot()
+	_test_light_limit()
 	_test_textured_and_broken()
 	_test_hostile()
 	# A script error (the add-on failing to compile, say) skips checks rather
@@ -273,6 +274,40 @@ func _test_spot() -> void:
 	_check(spot != null and _near(-spot.basis.z, Vector3.RIGHT), "spot: shines along its direction")
 	_check(spots.size() == 2 and is_finite((spots[1] as SpotLight3D).spot_angle_attenuation),
 		"spot: a hard edge (inner = outer) stays finite")
+	level.free()
+
+func _test_light_limit() -> void:
+	print("level: light limit")
+	var dir := "user://voxigen_tests/light_limit"
+	Fixtures.write_level(dir)
+	# Ten torches in a row, 1 m (32 voxels) apart along +x, reaching 4 m each.
+	var lights := []
+	for i in 10:
+		lights.append({"type": "point", "position": [i * 32, 32, 0], "color": [1, 1, 1], "range": 128})
+	var path := Fixtures.write_manifest(dir, {"lights": lights})
+	var level := _level(path, {"light_limit": 3, "light_limit_mode": 1, "light_fade_m": 2.0})
+	level.load_level(path)
+	_check(level.light_limit_active(), "Always turns the limit on whatever the renderer")
+	level.limit_lights(Vector3(0, 1, 0))
+	var lit := _of(level, "OmniLight3D")
+	_check(level._positional_lights.size() == 10 and lit.size() == 3, "only light_limit lights are in the scene")
+	_check(lit.all(func(l: OmniLight3D) -> bool: return l.position.x < 2.5), "the ones on are the nearest")
+	# The third-nearest stands 2 m from the camera.
+	_check(lit.all(func(l: OmniLight3D) -> bool: return l.distance_fade_enabled \
+		and is_equal_approx(l.distance_fade_begin, 0.0) and is_equal_approx(l.distance_fade_length, 2.0)),
+		"lights fade out by the distance of the last one kept")
+	level.limit_lights(Vector3(9, 1, 0))
+	_check(_of(level, "OmniLight3D").all(func(l: OmniLight3D) -> bool: return l.position.x > 6.5),
+		"moving the camera moves the set")
+	level.light_limit_mode = 2
+	_check(not level.light_limit_active() and _of(level, "OmniLight3D").size() == 10,
+		"Never puts every light back")
+	level.light_limit_mode = 1
+	level.limit_lights(Vector3(0, 1, 0))
+	var detached: Array = level._positional_lights.filter(func(l: Light3D) -> bool: return l.get_parent() == null)
+	level.clear()
+	_check(detached.size() == 7 and detached.all(func(l: Variant) -> bool: return not is_instance_valid(l)),
+		"clearing frees the lights the limit had off")
 	level.free()
 
 func _test_textured_and_broken() -> void:

@@ -23,6 +23,9 @@ signal marker_found(marker: String, at: Transform3D)
 ## The newest manifest version this importer reads. Older ones are read too.
 const MAX_VERSION := 3
 
+## How often (seconds) the light limit picks the lights nearest the camera.
+const LIGHT_UPDATE_S := 0.2
+
 ## The largest number a manifest may state, in voxels or any other unit. Godot
 ## keeps positions in 32-bit floats, so a value that is finite here (1e300) can
 ## still become infinite in a transform; a billion voxels is far past any level.
@@ -106,6 +109,29 @@ const MAX_MAGNITUDE := 1.0e9
 		shadow_distance_m = maxf(value, 0.0)
 		_changed()
 
+## On the Mobile and Compatibility renderers, only this many lights are on at
+## once: the ones nearest the camera. Compatibility is what every web export
+## runs, and WebGL does not drop the farthest lights when a scene has too many —
+## past about a hundred, all of the scene's lighting fails at once and a
+## torch-lit level renders black. 0: no limit.
+@export_range(0, 512) var light_limit: int = 48:
+	set(value):
+		light_limit = maxi(value, 0)
+		_apply_light_limit_mode()
+## Where [member light_limit] applies. Auto: on Mobile and Compatibility, as
+## decided by the renderer the game runs on, so one level suits every export
+## and Forward+ keeps all its lights. Always: on every renderer. Never: off.
+@export_enum("Auto", "Always", "Never") var light_limit_mode: int = 0:
+	set(value):
+		light_limit_mode = value
+		_apply_light_limit_mode()
+## How far (metres) a light takes to fade out as it drops out of the nearest
+## [member light_limit], so lights switching on and off as the camera moves
+## do not pop.
+@export var light_fade_m: float = 10.0:
+	set(value):
+		light_fade_m = maxf(value, 0.0)
+
 @export_group("Level of detail")
 ## Where the export's coarser meshes take over (metres from the camera): x for
 ## half the voxels, y for a quarter. Used only for modules exported with level
@@ -122,8 +148,12 @@ const MAX_MAGNITUDE := 1.0e9
 var _meshes: Dictionary = {}
 var _shapes: Dictionary = {}
 var _rebuild_pending := false
+## Point and spot lights the level built: what the light limit chooses from.
+var _positional_lights: Array[Light3D] = []
+var _light_clock := 0.0
 
 func _ready() -> void:
+	_apply_light_limit_mode()
 	if Engine.is_editor_hint():
 		_preview()
 	elif load_on_ready and not manifest_path.is_empty():
@@ -215,15 +245,102 @@ func load_level(path: String) -> int:
 	for light: Variant in _array(manifest.get("lights")):
 		_add_light(light)
 
+	for child in get_children():
+		if child.has_meta("voxigen_level") and (child is OmniLight3D or child is SpotLight3D):
+			_positional_lights.append(child)
+	if not light_limit_active() and _positional_lights.size() > 64 \
+			and RenderingServer.get_current_rendering_method() != "forward_plus" and not Engine.is_editor_hint():
+		push_warning("VoxiGenLevel: %d lights on the %s renderer with no light limit; past about a hundred, WebGL drops all lighting at once. Set light_limit." \
+			% [_positional_lights.size(), RenderingServer.get_current_rendering_method()])
+	if light_limit_active():
+		# Before the first frame: a frame drawn with every light can leave the
+		# web renderer's lighting broken for good, not just for that frame.
+		var camera := get_viewport().get_camera_3d() if is_inside_tree() else null
+		limit_lights(camera.global_position if camera else (global_position if is_inside_tree() else Vector3.ZERO))
+	_light_clock = 0.0
+
 	level_loaded.emit(meshes.size(), placed)
 	return placed
 
 ## Removes the level this node built.
 func clear() -> void:
+	_free_detached_lights()
+	_positional_lights.clear()
 	for child in get_children():
 		if child.has_meta("voxigen_level"):
 			remove_child(child)
 			child.queue_free()
+
+## True when [member light_limit] is switching lights here: Mobile or
+## Compatibility under Auto, any renderer under Always; never in the editor,
+## which shows the level as built.
+func light_limit_active() -> bool:
+	if Engine.is_editor_hint() or light_limit <= 0 or light_limit_mode == 2:
+		return false
+	return light_limit_mode == 1 or RenderingServer.get_current_rendering_method() != "forward_plus"
+
+func _apply_light_limit_mode() -> void:
+	set_process(light_limit_active())
+	if not light_limit_active():
+		for light in _positional_lights:
+			if is_instance_valid(light):
+				_set_lit(light, true)
+
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_PREDELETE:
+		_free_detached_lights()
+
+# A light the limit has off is out of the tree, not hidden: on the web a
+# hidden light still counts toward what breaks WebGL's lighting.
+func _set_lit(light: Light3D, lit: bool) -> void:
+	if lit and light.get_parent() == null:
+		add_child(light)
+	elif not lit and light.get_parent() == self:
+		remove_child(light)
+
+func _free_detached_lights() -> void:
+	for light in _positional_lights:
+		if is_instance_valid(light) and light.get_parent() == null:
+			light.free()
+
+func _process(delta: float) -> void:
+	_light_clock += delta
+	if _light_clock < LIGHT_UPDATE_S:
+		return
+	_light_clock = 0.0
+	var camera := get_viewport().get_camera_3d()
+	if camera:
+		limit_lights(camera.global_position)
+
+## Turns on the [member light_limit] lights nearest [param from] and turns off
+## the rest. Lights near the edge of the set fade out over
+## [member light_fade_m] on the way, so a light the next update turns off is
+## already dark. Called by the node itself while the limit is active.
+func limit_lights(from: Vector3) -> void:
+	var count := _positional_lights.size()
+	if count <= light_limit or light_limit <= 0:
+		for light in _positional_lights:
+			_set_lit(light, true)
+		return
+	# The lights are this node's children: measure in its space.
+	var here := global_transform.affine_inverse() * from if is_inside_tree() else from
+	var order := range(count)
+	var distance := PackedFloat32Array()
+	distance.resize(count)
+	for i in count:
+		distance[i] = _positional_lights[i].position.distance_to(here)
+	order.sort_custom(func(a: int, b: int) -> bool: return distance[a] < distance[b])
+	# Fade to dark by the distance of the last light kept: whatever lies past
+	# it is off, and what fades on the way never has a hard edge.
+	var edge := distance[order[light_limit - 1]]
+	var fade := minf(light_fade_m, edge)
+	for rank in count:
+		var light := _positional_lights[order[rank]]
+		_set_lit(light, rank < light_limit)
+		if rank < light_limit and fade > 0.0:
+			light.distance_fade_enabled = true
+			light.distance_fade_begin = edge - fade
+			light.distance_fade_length = fade
 
 func _changed() -> void:
 	# Once per frame however many settings change in it: dragging a slider in
