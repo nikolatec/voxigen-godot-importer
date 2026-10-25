@@ -11,4 +11,6 @@
 - One collision shape per module, shared across every chunk.
 - Textured exports keep their texture; vertex colour is used only where a
   mesh has it.
-- Every setting refreshes the editor preview.
+- Every setting refreshes the editor preview, once per frame.
+- Hostile input: non-bool `castsShadow`, numbers too large for a transform and
+  module paths outside the level folder are refused.

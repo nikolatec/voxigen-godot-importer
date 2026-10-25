@@ -8,8 +8,11 @@ extends SceneTree
 
 const Fixtures := preload("res://tests/fixtures.gd")
 const S := 1.0 / 32.0
+## Raise it when adding checks.
+const MIN_CHECKS := 62
 
 var failures := 0
+var checks := 0
 
 func _initialize() -> void:
 	_test_level("user://voxigen_tests/runtime", "loads from disk at runtime")
@@ -26,10 +29,17 @@ func _initialize() -> void:
 	_test_shared_shapes()
 	_test_spot()
 	_test_textured_and_broken()
-	print("\n%s" % ("ALL PASSED" if failures == 0 else "%d FAILED" % failures))
+	_test_hostile()
+	# A script error (the add-on failing to compile, say) skips checks rather
+	# than failing them, so passing also needs every check to have run.
+	if checks < MIN_CHECKS:
+		failures += 1
+		print("  FAIL  only %d checks ran, expected at least %d: look for script errors above" % [checks, MIN_CHECKS])
+	print("\n%s (%d checks)" % ["ALL PASSED" if failures == 0 else "%d FAILED" % failures, checks])
 	quit(1 if failures else 0)
 
 func _check(ok: bool, what: String) -> void:
+	checks += 1
 	if ok:
 		print("  ok    ", what)
 	else:
@@ -289,4 +299,39 @@ func _test_textured_and_broken() -> void:
 		"a textured module keeps its texture, without vertex colour")
 	_check(placed == 1 and level.get_node_or_null("broken_1_0_0") == null,
 		"a module that fails to load is skipped, the rest still built")
+	level.free()
+
+func _test_hostile() -> void:
+	print("level: hostile manifest")
+	var dir := "user://voxigen_tests/hostile"
+	Fixtures.write_level(dir)
+	var outside := "user://voxigen_tests/outside"
+	DirAccess.make_dir_recursive_absolute(outside)
+	Fixtures._write_glb(outside.path_join("secret.glb"), 32.0, Color.RED)
+	var path := Fixtures.write_manifest(dir, {
+		"modules": [
+			{"name": "cube", "file": "modules/cube.glb",
+				"lights": [{"type": "point", "position": [0, 8, 0], "color": [1, 1, 1], "range": 64, "castsShadow": "yes"}]},
+			{"name": "secret", "file": "../outside/secret.glb"},
+		],
+		"placements": [
+			{"module": "cube", "position": [0, 0, 0], "rotation": [0, 0, 0, 1]},
+			{"module": "cube", "position": [1e300, 0, 0], "rotation": [0, 0, 0, 1]},
+			{"module": "secret", "position": [0, 0, 0], "rotation": [0, 0, 0, 1]},
+		],
+		"lights": [{"type": "point", "position": [0, 0, 0], "color": [1, 1, 1], "range": 1e300}],
+	})
+	var level := _level(path)
+	var placed := level.load_level(path)
+	_check(placed == 1, "builds only the one sound placement (got %d)" % placed)
+	var omni := _of(level, "OmniLight3D")
+	_check(omni.size() == 2 and not (omni[0] as Light3D).shadow_enabled,
+		"a non-bool castsShadow means no shadow, and the light is still built")
+	_check(omni.size() == 2 and is_finite((omni[1] as OmniLight3D).omni_range),
+		"a non-finite range falls back instead of building an infinite light")
+	_check(level.get_node_or_null("secret_0_0_0") == null, "refuses a module outside the level folder")
+	level.free()
+
+	level = _level(path, {"confine_to_level_folder": false})
+	_check(level.load_level(path) == 2, "confine_to_level_folder off allows a shared folder outside")
 	level.free()

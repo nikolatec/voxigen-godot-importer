@@ -23,6 +23,11 @@ signal marker_found(marker: String, at: Transform3D)
 ## The newest manifest version this importer reads. Older ones are read too.
 const MAX_VERSION := 3
 
+## The largest number a manifest may state, in voxels or any other unit. Godot
+## keeps positions in 32-bit floats, so a value that is finite here (1e300) can
+## still become infinite in a transform; a billion voxels is far past any level.
+const MAX_MAGNITUDE := 1.0e9
+
 ## The level.json to build. Paths inside it are relative to it, so a level
 ## folder can be moved without editing the file. It may live under res:// (its
 ## GLBs imported by Godot) or anywhere on disk, user:// included (its GLBs read
@@ -63,6 +68,12 @@ const MAX_VERSION := 3
 	set(value):
 		chunk_size_m = maxf(value, 0.0)
 		_changed()
+
+## For a level outside the project (on disk or in user://, such as one a player
+## made), refuse module files outside the level's own folder, so a manifest
+## cannot point the importer at other files on the machine. A level under
+## res:// may share a modules folder beside it (../modules), as VOXEN's do.
+@export var confine_to_level_folder: bool = true
 
 @export_group("Collision")
 ## Give the level static collision: each module's mesh as a trimesh shape,
@@ -107,6 +118,7 @@ const MAX_VERSION := 3
 ## same path is read again.
 var _meshes: Dictionary = {}
 var _shapes: Dictionary = {}
+var _rebuild_pending := false
 
 func _ready() -> void:
 	if Engine.is_editor_hint():
@@ -143,6 +155,10 @@ func load_level(path: String) -> int:
 		if _is_marker(name):
 			continue
 		var full_path := _resolve(base_dir, file)
+		if not _allowed(base_dir, full_path):
+			push_warning("VoxiGenLevel: module '%s' points outside the level folder; skipped" % name)
+			failed[name] = true
+			continue
 		var mesh := _load_mesh(full_path)
 		if mesh == null:
 			failed[name] = true
@@ -153,7 +169,7 @@ func load_level(path: String) -> int:
 			var lod_path := full_path.trim_suffix(".glb") + ".lod%d.glb" % k
 			if named.size() >= k:
 				lod_path = _resolve(base_dir, str(named[k - 1]))
-			if _file_exists(lod_path):
+			if _allowed(base_dir, lod_path) and _file_exists(lod_path):
 				lods[k] = _load_mesh(lod_path)
 		meshes[name] = lods
 		var carried := _array(module.get("lights"))
@@ -207,10 +223,14 @@ func clear() -> void:
 			child.queue_free()
 
 func _changed() -> void:
-	if is_inside_tree() and Engine.is_editor_hint():
-		_preview()
+	# Once per frame however many settings change in it: dragging a slider in
+	# the inspector would otherwise rebuild the level on every step.
+	if is_inside_tree() and Engine.is_editor_hint() and not _rebuild_pending:
+		_rebuild_pending = true
+		_preview.call_deferred()
 
 func _preview() -> void:
+	_rebuild_pending = false
 	# In the editor the level is drawn for a look, not saved into the scene:
 	# its nodes have no owner, so the scene file keeps only this node and its
 	# settings, and the game builds the level itself when it runs.
@@ -251,13 +271,19 @@ func _numbers(value: Variant, count: int) -> PackedFloat64Array:
 	if not value is Array or (value as Array).size() != count:
 		return out
 	for item: Variant in value:
-		if typeof(item) != TYPE_INT and typeof(item) != TYPE_FLOAT:
+		if not _sane(item):
 			return PackedFloat64Array()
 		out.append(float(item))
 	return out
 
 func _resolve(base_dir: String, file: String) -> String:
 	return base_dir.path_join(file).simplify_path()
+
+func _allowed(base_dir: String, path: String) -> bool:
+	if not confine_to_level_folder or _in_project(base_dir + "/"):
+		return true
+	var root := base_dir.simplify_path().trim_suffix("/") + "/"
+	return path.begins_with(root)
 
 func _file_exists(path: String) -> bool:
 	return (_in_project(path) and ResourceLoader.exists(path)) or FileAccess.file_exists(path)
@@ -423,22 +449,28 @@ func _add_light(entry: Variant, at: Transform3D = Transform3D.IDENTITY) -> Light
 	if position.is_empty() or direction.is_empty() or color.is_empty():
 		push_warning("VoxiGenLevel: a %s light with a malformed position, direction or colour was skipped" % type)
 		return null
+	# Every value read and checked before a node exists, so nothing below can
+	# fail half-way and leave a light built but never added.
+	var shadow: Variant = light.get("castsShadow", false)
+	var casts_shadow: bool = typeof(shadow) == TYPE_BOOL and bool(shadow)
+	var range_m := _number(light, "range", 0.0) * voxel_size_m * light_range_scale
+	var energy := _number(light, "intensity", 1.0) * light_energy_scale
+	var outer_deg := clampf(_number(light, "outerDegrees", 45.0), 0.0, 180.0)
+	var inner_deg := clampf(_number(light, "innerDegrees", 0.0), 0.0, outer_deg) if light.has("innerDegrees") else -1.0
 	var node: Light3D
 	match type:
 		"point":
 			var omni := OmniLight3D.new()
-			omni.omni_range = _number(light, "range", 0.0) * voxel_size_m * light_range_scale
+			omni.omni_range = range_m
 			node = omni
 		"spot":
 			var spot := SpotLight3D.new()
-			spot.spot_range = _number(light, "range", 0.0) * voxel_size_m * light_range_scale
-			spot.spot_angle = clampf(_number(light, "outerDegrees", 45.0), 0.0, 180.0)
+			spot.spot_range = range_m
+			spot.spot_angle = outer_deg
 			# Godot has angular attenuation rather than an inner cone; this is
 			# the approximation its own glTF light importer uses.
-			if light.has("innerDegrees"):
-				var outer := spot.spot_angle
-				var inner := clampf(_number(light, "innerDegrees", 0.0), 0.0, outer)
-				var ratio := inner / outer if outer > 0.0 else 0.0
+			if inner_deg >= 0.0:
+				var ratio := inner_deg / outer_deg if outer_deg > 0.0 else 0.0
 				spot.spot_angle_attenuation = 0.2 / maxf(1.0 - ratio, 0.000001) - 0.1
 			node = spot
 		"directional":
@@ -447,8 +479,8 @@ func _add_light(entry: Variant, at: Transform3D = Transform3D.IDENTITY) -> Light
 			push_warning("VoxiGenLevel: a light of unknown type '%s' was skipped" % type)
 			return null
 	node.light_color = Color(color[0], color[1], color[2])
-	node.light_energy = _number(light, "intensity", 1.0) * light_energy_scale
-	node.shadow_enabled = light.get("castsShadow", false) == true
+	node.light_energy = energy
+	node.shadow_enabled = casts_shadow
 	if node.shadow_enabled and type != "directional" and shadow_distance_m > 0.0:
 		node.distance_fade_enabled = true
 		node.distance_fade_shadow = shadow_distance_m
@@ -467,4 +499,11 @@ func _add_light(entry: Variant, at: Transform3D = Transform3D.IDENTITY) -> Light
 
 func _number(from: Dictionary, key: String, fallback: float) -> float:
 	var value: Variant = from.get(key, fallback)
-	return float(value) if typeof(value) == TYPE_INT or typeof(value) == TYPE_FLOAT else fallback
+	return float(value) if _sane(value) else fallback
+
+# A number a manifest may state: an int or float, finite and within MAX_MAGNITUDE.
+func _sane(value: Variant) -> bool:
+	if typeof(value) != TYPE_INT and typeof(value) != TYPE_FLOAT:
+		return false
+	var number := float(value)
+	return is_finite(number) and absf(number) <= MAX_MAGNITUDE

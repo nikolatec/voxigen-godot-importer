@@ -64,7 +64,8 @@ turn off **Meshes → Generate LODs** in the import settings of the `modules`
 folder so the two kinds don't stack.
 
 Levels loaded at runtime are read as untrusted input: a malformed module,
-placement or light is skipped with a warning instead of being built wrong.
+placement or light is skipped with a warning instead of being built wrong, and
+modules must sit inside the level's own folder (`confine_to_level_folder`).
 
 ## Settings
 
@@ -74,6 +75,7 @@ placement or light is skipped with a warning instead of being built wrong.
 | `load_on_ready` | `true` | Build when the node enters the tree. |
 | `voxel_size_m` | `1/32` | Metres per voxel. VoxiGen works in voxels; the scale is yours. |
 | `marker_prefix` | `marker_` | Modules starting with this are markers. Empty: none are. |
+| `confine_to_level_folder` | `true` | For a level outside the project, refuse module files outside its folder. Levels under `res://` may share a `../modules` folder. |
 | `chunk_size_m` | `32` | Batch cell size. Smaller culls finer but makes more batches; `0` batches each module whole. |
 | `collision`, `collision_layer`, `collision_mask` | on, 1, 1 | Static trimesh collision. |
 | `light_energy_scale`, `light_range_scale` | `1`, `1` | Calibrate VoxiGen's light intensity and range for your renderer. |
