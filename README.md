@@ -23,7 +23,11 @@ each module goes. This add-on reads that folder and builds it:
   disk or in `user://` are read at runtime — so a game can load levels its
   players made.
 
-VOXEN, a voxel shooter, builds every one of its levels this way.
+VOXEN, a voxel shooter, builds every one of its levels this way. Below is its
+demo_halls level — 8,165 placements — built, lit and drawn by this add-on
+alone, in a plain Godot project:
+
+https://github.com/user-attachments/assets/70ca9e32-ba28-404e-9939-7025baceb1b8
 
 ## Install
 
