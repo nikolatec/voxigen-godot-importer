@@ -95,6 +95,7 @@ and refuses newer ones rather than building them wrongly.
 godot --headless --path . -s tests/generate.gd   # writes a test level into the project
 godot --headless --path . --import               # lets Godot import its GLBs
 godot --headless --path . -s tests/run_tests.gd  # builds test levels and checks them
+godot --path . -s tests/visual_check.gd          # renders them (needs a window)
 ```
 
 The test levels are generated cubes; the repository holds no art.

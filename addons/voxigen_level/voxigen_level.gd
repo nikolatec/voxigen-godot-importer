@@ -399,10 +399,9 @@ func _add_batch(module: String, cell: Vector3i, lods: Array, poses: Array) -> vo
 					node.visibility_range_end = far
 				2:
 					node.visibility_range_begin = lod_distances_m.y
-			# A metre of hysteresis, so a camera standing on a switch distance
-			# does not flicker between details.
-			node.visibility_range_begin_margin = 1.0 if node.visibility_range_begin > 0.0 else 0.0
-			node.visibility_range_end_margin = 1.0 if node.visibility_range_end > 0.0 else 0.0
+			# No margins: without a fade, Godot treats a margin as hysteresis
+			# that can leave every detail of a module hidden until the camera
+			# crosses a switch distance (tests/visual_check.gd).
 		_own(node)
 
 	if not collision or Engine.is_editor_hint():

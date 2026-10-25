@@ -12,5 +12,6 @@
 - Textured exports keep their texture; vertex colour is used only where a
   mesh has it.
 - Every setting that changes the preview refreshes it, once per frame.
+- Level of detail warns when `chunk_size_m` is 0.
 - Hostile input: non-bool `castsShadow`, numbers too large for a transform and
   module paths outside the level folder are refused.
